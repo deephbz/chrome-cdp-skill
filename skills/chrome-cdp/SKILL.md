@@ -67,8 +67,8 @@ scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
-scripts/cdp.mjs open    [url]                  # open new tab (each triggers Allow prompt)
-scripts/cdp.mjs stop    [target]               # stop daemon(s)
+scripts/cdp.mjs open    [url]                  # open new tab (reuses the hub; no new prompt)
+scripts/cdp.mjs stop                           # stop the hub (ends the shared session)
 ```
 
 ## Coordinates
@@ -83,8 +83,8 @@ CSS px = screenshot image px / DPR
 
 ## Tips
 
-- Prefer `snap --compact` over `html` for page structure.
+- Prefer `snap` over `html` for page structure (the snapshot is already compacted).
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
-- Chrome shows an "Allow debugging" modal once per tab on first access. A background daemon keeps the session alive so subsequent commands need no further approval. Daemons auto-exit after 8 hours of inactivity by default; override with `CDP_IDLE_TIMEOUT_MS`.
-- To minimize prompts, reuse existing targets, avoid `scripts/cdp.mjs open` unless a new tab is necessary, and do not run `scripts/cdp.mjs stop` until the browser work is done.
+- Chrome 144+ asks you to approve each remote-debugging *connection*. A single background hub holds one connection open and runs every command (`list`, `doctor`, and all page commands across every tab) over it, so you approve **once per session**, not once per tab or per `list`/`doctor` call. The hub auto-exits after 8 hours of inactivity by default; override with `CDP_IDLE_TIMEOUT_MS`.
+- That one approval lasts until the hub exits (idle timeout, `scripts/cdp.mjs stop`, or Chrome closing). Avoid `scripts/cdp.mjs stop` until the browser work is done, so you don't re-trigger the prompt.
 - For tasks that need the user's logged-in Chrome session but should not disturb the main window, first run `doctor`/`list`, then create or reuse a separate normal Chrome window and operate only on targets from that window. Do not launch an isolated `--user-data-dir` profile for this case because it will not share the user's session.
