@@ -10,7 +10,7 @@
 // "Allow debugging" prompt for the whole session — list/doctor/page commands
 // all reuse it. The hub auto-exits after the configured idle timeout.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, openSync, closeSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn, spawnSync } from 'child_process';
@@ -23,6 +23,12 @@ const IDLE_TIMEOUT = Number.parseInt(process.env.CDP_IDLE_TIMEOUT_MS || '', 10) 
 // First attach to a tab blocks on the user clicking Chrome's "Allow debugging"
 // modal. Give them real time instead of timing out at the generic 15s.
 const ALLOW_PROMPT_TIMEOUT = Number.parseInt(process.env.CDP_ALLOW_TIMEOUT_MS || '', 10) || 120000;
+// A discarded/unloaded tab attaches fine but never answers renderer-bound
+// commands. Probe with a short timeout so we fail fast with a clear diagnostic
+// instead of the generic 15s hang; once activated, give the renderer time to
+// spin back up before giving up.
+const RENDERER_PROBE_TIMEOUT = Number.parseInt(process.env.CDP_RENDERER_PROBE_MS || '', 10) || 3000;
+const ACTIVATE_WAKE_TIMEOUT = Number.parseInt(process.env.CDP_ACTIVATE_WAIT_MS || '', 10) || 10000;
 const DAEMON_CONNECT_RETRIES = 30;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
@@ -244,11 +250,20 @@ class CDP {
 
   async connect(wsUrl, timeoutMs = TIMEOUT) {
     return new Promise((res, rej) => {
+      let opened = false;
       this.#ws = new WebSocket(wsUrl);
       const timer = setTimeout(() => rej(new Error('WebSocket connect timeout')), timeoutMs);
-      this.#ws.onopen = () => { clearTimeout(timer); res(); };
+      this.#ws.onopen = () => { opened = true; clearTimeout(timer); res(); };
       this.#ws.onerror = (e) => { clearTimeout(timer); rej(new Error('WebSocket error: ' + (e.message || e.type))); };
-      this.#ws.onclose = () => this.#closeHandlers.forEach(h => h());
+      this.#ws.onclose = () => {
+        clearTimeout(timer);
+        // Closed before it ever opened: settle connect() now instead of waiting out the timeout.
+        if (!opened) rej(new Error('connection closed before open'));
+        // Fail in-flight commands cleanly instead of letting them hang to timeout.
+        for (const { reject } of this.#pending.values()) reject(new Error('connection closed'));
+        this.#pending.clear();
+        this.#closeHandlers.forEach(h => h());
+      };
       this.#ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.id && this.#pending.has(msg.id)) {
@@ -291,13 +306,16 @@ class CDP {
     };
   }
 
-  waitForEvent(method, timeout = TIMEOUT) {
+  waitForEvent(method, timeout = TIMEOUT, sessionId) {
     let settled = false;
     let off;
     let timer;
     const promise = new Promise((resolve, reject) => {
-      off = this.onEvent(method, (params) => {
+      off = this.onEvent(method, (params, msg) => {
         if (settled) return;
+        // With one connection multiplexing many flat sessions, ignore events
+        // from other targets so e.g. a background tab's load can't satisfy us.
+        if (sessionId && msg.sessionId !== sessionId) return;
         settled = true;
         clearTimeout(timer);
         off();
@@ -500,7 +518,7 @@ async function navStr(cdp, sid, url) {
     throw new Error(`Invalid URL: ${url}`);
   }
   await cdp.send('Page.enable', {}, sid);
-  const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT);
+  const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT, sid);
   const result = await cdp.send('Page.navigate', { url }, sid);
   if (result.errorText) {
     loadEvent.cancel();
@@ -603,6 +621,67 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
 }
 
 // ---------------------------------------------------------------------------
+// Discarded-tab handling
+// ---------------------------------------------------------------------------
+//
+// Chrome unloads background tabs' renderers to save memory ("discarded"). Such a
+// tab still exists as a target and attaches fine, but EVERY renderer-bound
+// command (Runtime.enable, Page.enable, Accessibility.*, Input.*) hangs forever
+// because nothing is on the other end. There is no `discarded` flag in
+// TargetInfo, so we detect the condition behaviorally: poke the renderer with a
+// short-timeout Runtime.enable (idempotent, returns in a few ms on a live tab).
+// If it stays silent, the renderer is gone — surface a clear diagnostic instead
+// of the generic 15s "Timeout: Runtime.enable".
+
+function discardedHint(targetId) {
+  const id = targetId.slice(0, 8);
+  return [
+    `Target ${id} is attached but its renderer is not responding within ${RENDERER_PROBE_TIMEOUT}ms — the tab looks discarded/unloaded (Chrome drops background tabs' renderers to free memory).`,
+    'Wake it one of these ways:',
+    '  - Focus/click the tab in Chrome so it reloads, then retry the command.',
+    '  - Re-run with --activate (or CDP_ACTIVATE=1) to wake it automatically.',
+    'Note: --activate foregrounds and reloads the tab, so it WILL disturb the current foreground tab. That is why it is opt-in, not the default.',
+  ].join('\n');
+}
+
+async function rendererResponds(cdp, sid) {
+  try {
+    await cdp.send('Runtime.enable', {}, sid, RENDERER_PROBE_TIMEOUT);
+    return true;
+  } catch (e) {
+    if (/^Timeout:/.test(e.message)) return false;
+    throw e; // a real protocol error (e.g. dead session) is not our concern here
+  }
+}
+
+// Gate every page command: confirm the target's renderer is alive (optionally
+// waking it first), or throw a fast, self-explanatory error.
+async function ensureRendererLive(cdp, sid, targetId, activate) {
+  if (activate) {
+    // Activation foregrounds the tab and reloads a discarded one; opt-in only.
+    await cdp.send('Target.activateTarget', { targetId });
+    const deadline = Date.now() + ACTIVATE_WAKE_TIMEOUT;
+    while (Date.now() < deadline) {
+      if (await rendererResponds(cdp, sid)) return;
+      await sleep(200);
+    }
+    throw new Error(`Activated ${targetId.slice(0, 8)} but its renderer did not wake within ${ACTIVATE_WAKE_TIMEOUT}ms.`);
+  }
+
+  if (await rendererResponds(cdp, sid)) return;
+
+  // Renderer is silent. Tell a discarded tab apart from a closed one with a fast
+  // browser-level call (these answer even when the renderer is gone).
+  let exists = false;
+  try {
+    const info = await cdp.send('Target.getTargetInfo', { targetId }, undefined, RENDERER_PROBE_TIMEOUT);
+    exists = !!info?.targetInfo;
+  } catch {}
+  if (!exists) throw new Error(`Target ${targetId.slice(0, 8)} no longer exists (tab closed?). Run "cdp list".`);
+  throw new Error(discardedHint(targetId));
+}
+
+// ---------------------------------------------------------------------------
 // Browser hub daemon — one connection, one consent prompt, many sessions
 // ---------------------------------------------------------------------------
 //
@@ -615,16 +694,6 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
 
 async function runHub() {
   const sp = sockPath('hub');
-
-  // Defer to a live hub if one already owns the socket. A rival hub would open a
-  // second connection = a second consent prompt, the pile-up we exist to avoid.
-  try {
-    const existing = await connectToSocket(sp);
-    existing.destroy();
-    process.exit(0);
-  } catch {}
-  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
-
   const cdp = new CDP();
 
   // Readiness gate: resolves once the single browser connection is approved and
@@ -678,9 +747,29 @@ async function runHub() {
     if (p) p.then(sid => targetBySession.delete(sid)).catch(() => {});
   }
 
+  // A page command failing with one of these means our cached session is stale
+  // (tab closed/navigated between commands and we missed the event). Evict + retry.
+  const DEAD_SESSION = /Session with given id not found|No target with given id|Target closed|target closed|Inspected target navigated or closed/i;
+  async function dispatchPage(cmd, sid, targetId, args) {
+    switch (cmd) {
+      case 'snap': case 'snapshot': return snapshotStr(cdp, sid, true);
+      case 'eval': return evalStr(cdp, sid, args[0]);
+      case 'shot': case 'screenshot': return shotStr(cdp, sid, args[0], targetId);
+      case 'html': return htmlStr(cdp, sid, args[0]);
+      case 'nav': case 'navigate': return navStr(cdp, sid, args[0]);
+      case 'net': case 'network': return netStr(cdp, sid);
+      case 'click': return clickStr(cdp, sid, args[0]);
+      case 'clickxy': return clickXyStr(cdp, sid, args[0], args[1]);
+      case 'type': return typeStr(cdp, sid, args[0]);
+      case 'loadall': return loadAllStr(cdp, sid, args[0], args[1] ? parseInt(args[1]) : 1500);
+      case 'evalraw': return evalRawStr(cdp, sid, args[0], args[1]);
+      default: throw new Error(`Unknown command: ${cmd}`);
+    }
+  }
+
   // Handle a command. Page commands run against a flat session; list/open/doctor
   // use the browser connection directly.
-  async function handleCommand({ cmd, targetId, args = [] }) {
+  async function handleCommand({ cmd, targetId, args = [], activate = false }) {
     if (cmd === 'stop') return { ok: true, result: '', stopAfter: true };
     resetIdle();
     try {
@@ -695,20 +784,19 @@ async function runHub() {
           break;
         }
         default: {
-          const sid = await sessionFor(targetId);
-          switch (cmd) {
-            case 'snap': case 'snapshot': result = await snapshotStr(cdp, sid, true); break;
-            case 'eval': result = await evalStr(cdp, sid, args[0]); break;
-            case 'shot': case 'screenshot': result = await shotStr(cdp, sid, args[0], targetId); break;
-            case 'html': result = await htmlStr(cdp, sid, args[0]); break;
-            case 'nav': case 'navigate': result = await navStr(cdp, sid, args[0]); break;
-            case 'net': case 'network': result = await netStr(cdp, sid); break;
-            case 'click': result = await clickStr(cdp, sid, args[0]); break;
-            case 'clickxy': result = await clickXyStr(cdp, sid, args[0], args[1]); break;
-            case 'type': result = await typeStr(cdp, sid, args[0]); break;
-            case 'loadall': result = await loadAllStr(cdp, sid, args[0], args[1] ? parseInt(args[1]) : 1500); break;
-            case 'evalraw': result = await evalRawStr(cdp, sid, args[0], args[1]); break;
-            default: return { ok: false, error: `Unknown command: ${cmd}` };
+          // Flat session per target; if it went stale (tab closed/navigated
+          // between commands) evict and re-attach once.
+          for (let attempt = 0; ; attempt++) {
+            const sid = await sessionFor(targetId);
+            try {
+              await ensureRendererLive(cdp, sid, targetId, activate);
+              result = await dispatchPage(cmd, sid, targetId, args);
+              break;
+            }
+            catch (e) {
+              if (attempt === 0 && DEAD_SESSION.test(e.message)) { evictTarget(targetId); continue; }
+              throw e;
+            }
           }
         }
       }
@@ -720,7 +808,7 @@ async function runHub() {
 
   // Unix socket server — NDJSON protocol
   // Wire format: each message is one JSON object followed by \n (newline-delimited JSON).
-  // Request:  { "id": <number>, "cmd": "<command>", "targetId": "<id>", "args": ["arg1", ...] }
+  // Request:  { "id": <number>, "cmd": "<command>", "targetId": "<id>", "args": ["arg1", ...], "activate": <boolean> }
   // Response: { "id": <number>, "ok": <boolean>, "result": "<string>" }
   //           or { "id": <number>, "ok": false, "error": "<message>" }
   server = net.createServer((conn) => {
@@ -747,19 +835,69 @@ async function runHub() {
     });
   });
 
-  server.on('error', (e) => {
-    // Lost a startup race to another hub: defer without stealing its socket.
-    if (e.code === 'EADDRINUSE') process.exit(0);
-    process.stderr.write(`Hub server listen failed: ${e.message}\n`);
-    process.exit(1);
+  // Win socket ownership BEFORE opening any Chrome connection. A hub that loses
+  // the startup race must exit without ever calling cdp.connect(), or it would
+  // trigger the very second consent prompt this design eliminates. Crucially we
+  // never unlink a path we don't own: on EADDRINUSE, defer to a reachable
+  // incumbent; only clear a genuinely stale socket file, then retry once.
+  const listenOnce = () => new Promise((resolve, reject) => {
+    const onErr = (e) => { server.removeListener('listening', onOk); reject(e); };
+    const onOk = () => { server.removeListener('error', onErr); resolve(); };
+    server.once('listening', onOk);
+    server.once('error', onErr);
+    server.listen(sp);
   });
+  try {
+    await listenOnce();
+  } catch (e) {
+    if (e.code !== 'EADDRINUSE') { process.stderr.write(`Hub listen failed: ${e.message}\n`); process.exit(1); }
+    // Path is taken. If a live hub is accepting there, defer to it.
+    try { const c = await connectToSocket(sp); c.destroy(); process.exit(0); } catch {}
+    // No acceptor — the socket file looks stale. But a concurrent cold-start hub
+    // could rebuild it at any moment, and unlinking a path another hub just bound
+    // would orphan it and cause a second connection/prompt. Serialize the
+    // unlink+rebind through an exclusive lock so exactly one process does it, and
+    // re-check for a live hub under the lock before touching the socket.
+    const lock = sp + '.lock';
+    const LOCK_STALE_MS = 10000;
+    let haveLock = false;
+    for (let i = 0; i < 50 && !haveLock; i++) {
+      try { closeSync(openSync(lock, 'wx')); haveLock = true; }
+      catch (le) {
+        if (le.code !== 'EEXIST') { process.stderr.write(`Hub lock failed: ${le.message}\n`); process.exit(1); }
+        // Someone else holds the lock. They may become the live hub — defer if so.
+        try { const c = await connectToSocket(sp); c.destroy(); process.exit(0); } catch {}
+        // Reclaim an abandoned lock (holder crashed mid-cleanup).
+        try { if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) unlinkSync(lock); } catch {}
+        await sleep(100);
+      }
+    }
+    if (!haveLock) { process.stderr.write('Hub lock contention timeout\n'); process.exit(1); }
+    // Re-check for a live hub under the lock; defer if one exists. Decide
+    // liveness as a boolean FIRST, so a failing lock cleanup can never make us
+    // fall through and unlink a socket another hub is live on.
+    let incumbentAlive = false;
+    try { const c = await connectToSocket(sp); c.destroy(); incumbentAlive = true; } catch {}
+    if (incumbentAlive) { try { unlinkSync(lock); } catch {} process.exit(0); }
+    // Genuinely stale socket: clear it and bind.
+    if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
+    try {
+      await listenOnce();
+    } catch (e2) {
+      try { unlinkSync(lock); } catch {}
+      if (e2.code === 'EADDRINUSE') process.exit(0); // lost a race to a concurrent hub
+      process.stderr.write(`Hub listen failed: ${e2.message}\n`);
+      process.exit(1);
+    }
+    try { unlinkSync(lock); } catch {} // own the socket now; release the lock
+  }
+  // Now we own the socket. Handle any later (post-startup) server errors too.
+  server.on('error', (e) => { process.stderr.write(`Hub server error: ${e.message}\n`); shutdown(1); });
 
-  server.listen(sp);
-
-  // Socket is live; now open the single browser connection. This is what
-  // triggers Chrome's one "Allow debugging" prompt, and it can sit pending until
-  // the user clicks — Chrome 144+ may gate either the WS handshake or the first
-  // command, so give both a generous window.
+  // Open the single browser connection. This is what triggers Chrome's one
+  // "Allow debugging" prompt, and it can sit pending until the user clicks —
+  // Chrome 144+ may gate either the WS handshake or the first command, so give
+  // both a generous window.
   try {
     await cdp.connect(getWsUrl(), ALLOW_PROMPT_TIMEOUT);
     await cdp.send('Target.getTargets', {}, undefined, ALLOW_PROMPT_TIMEOUT);
@@ -798,9 +936,8 @@ async function getOrStartHub() {
   // Reuse the running hub if present (no new connection, no new prompt).
   try { return await connectToSocket(sp); } catch {}
 
-  // Clean stale socket
-  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
-
+  // No live hub. Don't unlink here — the hub owns socket-file lifecycle and
+  // clears a stale file itself, so we never race-clobber a starting incumbent.
   // Spawn the hub
   const child = spawn(process.execPath, [process.argv[1], '_hub'], {
     detached: true,
@@ -913,6 +1050,20 @@ Usage: cdp <command> [args]
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
 use more characters.
 
+FLAGS
+  --activate    Wake a discarded/unloaded tab before the command by foregrounding
+                it (also CDP_ACTIVATE=1). Off by default because it disturbs the
+                user's foreground tab. See DISCARDED TABS below.
+
+DISCARDED TABS
+  Chrome unloads background tabs' renderers to save memory ("discarded"). A
+  discarded tab still appears in "cdp list", but page commands against it would
+  otherwise hang ~15s — so cdp probes the renderer (short timeout) and, if it is
+  silent, fails fast with a diagnostic. To proceed: focus the tab in Chrome so it
+  reloads, or re-run with --activate to wake it automatically (this foregrounds
+  and reloads the tab). Probe/wake timeouts: CDP_RENDERER_PROBE_MS (default 3000),
+  CDP_ACTIVATE_WAIT_MS (default 10000).
+
 COORDINATE SYSTEM
   shot captures the viewport at the device's native resolution.
   The screenshot image size = CSS pixels × DPR (device pixel ratio).
@@ -946,6 +1097,7 @@ HUB IPC (for advanced use / scripting)
   Commands mirror the CLI: list, snap, eval, shot, html, nav, net, click,
   clickxy, type, loadall, evalraw, open, stop. Use evalraw for arbitrary CDP
   methods. targetId is required for page commands (full id, not a prefix).
+  Add "activate":true to a page-command request to wake a discarded tab first.
 `;
 
 const NEEDS_TARGET = new Set([
@@ -954,7 +1106,13 @@ const NEEDS_TARGET = new Set([
 ]);
 
 async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+  const raw = process.argv.slice(2);
+  // Opt-in renderer wake for discarded/unloaded tabs. Off by default: activation
+  // foregrounds + reloads the tab, which this skill exists to avoid doing to the
+  // user's real profile. Strip it so it never lands in command args (eval expr,
+  // type text, etc.); position-independent.
+  const activate = process.env.CDP_ACTIVATE === '1' || raw.includes('--activate');
+  const [cmd, ...args] = raw.filter(a => a !== '--activate');
 
   // Hub mode (internal)
   if (cmd === '_hub') { await runHub(); return; }
@@ -1047,7 +1205,7 @@ async function main() {
     process.exit(1);
   }
 
-  const response = await sendCommand(conn, { cmd, targetId, args: cmdArgs });
+  const response = await sendCommand(conn, { cmd, targetId, args: cmdArgs, activate });
 
   if (response.ok) {
     if (response.result) console.log(response.result);
