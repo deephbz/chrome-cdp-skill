@@ -25,6 +25,8 @@ scripts/cdp.mjs doctor
 
 Run this before browser work if the current Chrome CDP state is unknown. If it reports `No DevToolsActivePort found`, open `chrome://inspect/#remote-debugging` in the real Chrome app, enable remote debugging for that browser session, then rerun `doctor` and `list`.
 
+If `doctor` reports `Local debug port 127.0.0.1:9222: http-no-json (HTTP 404)`, Chrome is in the Chrome 144+ auto-connect mode. That is intended for Chrome DevTools MCP / agent-browser auto-connect and does not expose the legacy `/json/*` discovery endpoints this raw CDP CLI needs. In that state, use Chrome DevTools MCP / agent-browser for the live profile, or restart Chrome with legacy CDP flags and a non-default `--user-data-dir` when raw CDP is required.
+
 ### List open pages
 
 ```bash

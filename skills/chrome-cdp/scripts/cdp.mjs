@@ -125,6 +125,37 @@ function getChromeProcesses() {
     .filter(Boolean);
 }
 
+async function probeLocalDebugPort(port = Number.parseInt(process.env.CDP_DEBUG_PORT || '9222', 10)) {
+  const host = process.env.CDP_HOST || '127.0.0.1';
+  return new Promise((resolve) => {
+    const socket = net.connect({ host, port });
+    let data = '';
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve({ host, port, ...result });
+    };
+    socket.setTimeout(1500);
+    socket.on('connect', () => {
+      socket.write(`GET /json/version HTTP/1.1\r\nHost: ${host}:${port}\r\nConnection: close\r\n\r\n`);
+    });
+    socket.on('data', chunk => {
+      data += chunk.toString();
+      const status = data.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/m)?.[1];
+      if (status) finish({ state: status === '200' ? 'cdp-http' : 'http-no-json', status });
+    });
+    socket.on('timeout', () => finish({ state: 'timeout' }));
+    socket.on('error', error => finish({ state: 'closed', error: error.message }));
+    socket.on('close', () => {
+      const status = data.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/m)?.[1];
+      if (!status) finish({ state: data ? 'unknown-response' : 'closed' });
+      else finish({ state: status === '200' ? 'cdp-http' : 'http-no-json', status });
+    });
+  });
+}
+
 async function doctorStr() {
   const candidates = getPortFileCandidates();
   const found = candidates.filter(path => existsSync(path));
@@ -138,6 +169,14 @@ async function doctorStr() {
   for (const proc of chromeProcesses.slice(0, 5)) lines.push(`  - ${proc}`);
 
   if (found.length === 0) {
+    const probe = await probeLocalDebugPort();
+    lines.push(`Local debug port ${probe.host}:${probe.port}: ${probe.state}${probe.status ? ` (HTTP ${probe.status})` : ''}`);
+    if (probe.state === 'http-no-json') {
+      lines.push('');
+      lines.push('Chrome remote debugging appears enabled through the Chrome 144+ auto-connect UI, but this raw CDP CLI cannot discover targets from that WebSocket-only mode without DevToolsActivePort.');
+      lines.push('Use Chrome DevTools MCP / agent-browser auto-connect for this browser session, or restart Chrome with legacy CDP flags and a non-default user-data-dir if raw CDP is required.');
+      return lines.join('\n');
+    }
     lines.push('');
     lines.push(remoteDebuggingHint(candidates));
     return lines.join('\n');
