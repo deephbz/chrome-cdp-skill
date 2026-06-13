@@ -17,6 +17,14 @@ Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no
 
 All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId prefix from `list`; copy the full prefix shown in the `list` output (for example `6BE827FA`). The CLI rejects ambiguous prefixes.
 
+### Diagnose Chrome CDP availability
+
+```bash
+scripts/cdp.mjs doctor
+```
+
+Run this before browser work if the current Chrome CDP state is unknown. If it reports `No DevToolsActivePort found`, open `chrome://inspect/#remote-debugging` in the real Chrome app, enable remote debugging for that browser session, then rerun `doctor` and `list`.
+
 ### List open pages
 
 ```bash
@@ -76,3 +84,4 @@ CSS px = screenshot image px / DPR
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
 - Chrome shows an "Allow debugging" modal once per tab on first access. A background daemon keeps the session alive so subsequent commands need no further approval. Daemons auto-exit after 8 hours of inactivity by default; override with `CDP_IDLE_TIMEOUT_MS`.
 - To minimize prompts, reuse existing targets, avoid `scripts/cdp.mjs open` unless a new tab is necessary, and do not run `scripts/cdp.mjs stop` until the browser work is done.
+- For tasks that need the user's logged-in Chrome session but should not disturb the main window, first run `doctor`/`list`, then create or reuse a separate normal Chrome window and operate only on targets from that window. Do not launch an isolated `--user-data-dir` profile for this case because it will not share the user's session.

@@ -10,7 +10,7 @@
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import net from 'net';
 
 const TIMEOUT = 15000;
@@ -36,7 +36,7 @@ function sockPath(targetId) {
     : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
-function getWsUrl() {
+function getPortFileCandidates() {
   const home = homedir();
   // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
   const macBrowsers = [
@@ -80,12 +80,80 @@ function getWsUrl() {
       ];
     }) : []),
   ].filter(Boolean);
+  return candidates;
+}
+
+function remoteDebuggingHint(candidates = getPortFileCandidates()) {
+  const checked = candidates.slice(0, 8).map(path => `  - ${path}`).join('\n');
+  return [
+    'No DevToolsActivePort found. Chrome remote debugging is not exposed for this browser session.',
+    '',
+    'Recovery:',
+    '  1. In the real Chrome window, open chrome://inspect/#remote-debugging',
+    '  2. Turn on "Allow remote debugging" for this Chrome session.',
+    '  3. Run `cdp.mjs doctor`, then `cdp.mjs list` again.',
+    '',
+    'Notes:',
+    '  - Chrome may require the user to approve its "Allow debugging" prompt on first tab access.',
+    '  - Keep the per-tab daemon alive and avoid `cdp.mjs stop` to prevent repeated prompts.',
+    '  - For user-session work, create a separate normal Chrome window after remote debugging is enabled.',
+    '',
+    'Checked common port files:',
+    checked,
+  ].join('\n');
+}
+
+function getWsUrl() {
+  const candidates = getPortFileCandidates();
   const portFile = candidates.find(p => existsSync(p));
-  if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
+  if (!portFile) throw new Error(remoteDebuggingHint(candidates));
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
   const host = process.env.CDP_HOST || '127.0.0.1';
   return `ws://${host}:${lines[0]}${lines[1]}`;
+}
+
+function getChromeProcesses() {
+  if (IS_WINDOWS) return [];
+  const result = spawnSync('ps', ['axo', 'pid=,command='], { encoding: 'utf8' });
+  if (result.error || result.status !== 0) return [];
+  return result.stdout
+    .split('\n')
+    .filter(line => /Google Chrome|Chromium|Brave Browser|Microsoft Edge/.test(line))
+    .filter(line => !/Helper|Crashpad|Renderer|GPU/.test(line))
+    .map(line => line.trim())
+    .filter(Boolean);
+}
+
+async function doctorStr() {
+  const candidates = getPortFileCandidates();
+  const found = candidates.filter(path => existsSync(path));
+  const lines = ['CDP doctor'];
+  lines.push(`Runtime dir: ${RUNTIME_DIR}`);
+  lines.push(`Port files found: ${found.length}`);
+  for (const path of found) lines.push(`  - ${path}`);
+
+  const chromeProcesses = getChromeProcesses();
+  lines.push(`Chrome-like browser processes: ${chromeProcesses.length}`);
+  for (const proc of chromeProcesses.slice(0, 5)) lines.push(`  - ${proc}`);
+
+  if (found.length === 0) {
+    lines.push('');
+    lines.push(remoteDebuggingHint(candidates));
+    return lines.join('\n');
+  }
+
+  try {
+    const cdp = new CDP();
+    await cdp.connect(getWsUrl());
+    const pages = await getPages(cdp);
+    cdp.close();
+    lines.push(`Connection: ok (${pages.length} page target(s))`);
+    lines.push('Next: run `cdp.mjs list`, then reuse an existing target or create a separate normal Chrome window for user-session work.');
+  } catch (error) {
+    lines.push(`Connection: failed (${error.message})`);
+  }
+  return lines.join('\n');
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -725,6 +793,7 @@ const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 
 Usage: cdp <command> [args]
 
+  doctor                            Diagnose Chrome remote-debugging availability
   list                              List open pages (shows unique target prefixes)
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
@@ -789,6 +858,11 @@ async function main() {
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE); process.exit(0);
+  }
+
+  if (cmd === 'doctor' || cmd === 'diag') {
+    console.log(await doctorStr());
+    return;
   }
 
   if (cmd === 'list' || cmd === 'ls') {
