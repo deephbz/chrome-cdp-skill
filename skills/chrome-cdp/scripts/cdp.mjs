@@ -106,8 +106,8 @@ function remoteDebuggingHint(candidates = getPortFileCandidates()) {
     '  3. Run `cdp.mjs doctor`, then `cdp.mjs list` again.',
     '',
     'Notes:',
-    '  - Chrome may require the user to approve its "Allow debugging" prompt on first tab access.',
-    '  - Keep the per-tab daemon alive and avoid `cdp.mjs stop` to prevent repeated prompts.',
+    '  - Chrome may require the user to approve its "Allow debugging" prompt on first hub session.',
+    '  - Keep the shared hub alive and avoid `cdp.mjs stop` to prevent repeated prompts.',
     '  - For user-session work, create a separate normal Chrome window after remote debugging is enabled.',
     '',
     'Checked common port files:',
@@ -181,6 +181,22 @@ async function doctorStr() {
   const chromeProcesses = getChromeProcesses();
   lines.push(`Chrome-like browser processes: ${chromeProcesses.length}`);
   for (const proc of chromeProcesses.slice(0, 5)) lines.push(`  - ${proc}`);
+
+  if (process.env.CDP_WS_URL) {
+    lines.push('CDP_WS_URL: set');
+    lines.push('Note: an existing hub in this runtime dir is reused. Use a separate XDG_RUNTIME_DIR or run `cdp.mjs stop` when switching browser endpoints.');
+    try {
+      const conn = await getOrStartHub();
+      const res = await sendCommand(conn, { cmd: 'list_raw' });
+      if (!res.ok) throw new Error(res.error);
+      const pages = JSON.parse(res.result);
+      lines.push(`Connection: ok (${pages.length} page target(s))`);
+      lines.push('Next: run `cdp.mjs list`, then reuse an existing target or create a separate normal Chrome window for user-session work.');
+    } catch (error) {
+      lines.push(`Connection: failed (${error.message})`);
+    }
+    return lines.join('\n');
+  }
 
   if (found.length === 0) {
     const probe = await probeLocalDebugPort();

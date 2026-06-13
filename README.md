@@ -45,18 +45,18 @@ scripts/cdp.mjs clickxy <target> <x> <y>          # click at CSS pixel coordinat
 scripts/cdp.mjs type   <target> "text"            # type at focused element (works in cross-origin iframes)
 scripts/cdp.mjs loadall <target> "selector"       # click "load more" until gone
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
-scripts/cdp.mjs open   [url]                      # open new tab (triggers Allow prompt)
-scripts/cdp.mjs stop   [target]                   # stop daemon(s)
+scripts/cdp.mjs open   [url]                      # open new tab through the shared hub
+scripts/cdp.mjs stop                              # stop the hub
 ```
 
 `<target>` is a unique prefix of the targetId shown by `list`.
 
 ## Why not chrome-devtools-mcp?
 
-[chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) reconnects on every command, so Chrome's "Allow debugging" modal can re-appear repeatedly and target enumeration times out with many tabs open. `chrome-cdp` holds one persistent daemon per tab — the modal fires once, and it handles 100+ tabs reliably.
+[chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) reconnects on every command, so Chrome's "Allow debugging" modal can re-appear repeatedly and target enumeration times out with many tabs open. `chrome-cdp` holds one persistent browser-level hub connection and multiplexes all page targets through it, so the modal fires once per hub session and it handles 100+ tabs reliably.
 
 ## How it works
 
-Connects directly to Chrome's remote debugging WebSocket — no Puppeteer, no intermediary. On first access to a tab, a lightweight background daemon is spawned that holds the session open. Chrome's "Allow debugging" modal appears once per tab; subsequent commands reuse the daemon silently. Daemons auto-exit after 20 minutes of inactivity.
+Connects directly to Chrome's remote debugging WebSocket — no Puppeteer, no intermediary. A lightweight background hub keeps one browser-level CDP connection open and attaches page targets as flat sessions. Chrome's "Allow debugging" modal appears once per hub session; subsequent commands reuse that approved connection silently. The hub auto-exits after 8 hours of inactivity by default.
 
 This approach is also why it handles 100+ open tabs reliably, where tools built on Puppeteer often time out during target enumeration.
