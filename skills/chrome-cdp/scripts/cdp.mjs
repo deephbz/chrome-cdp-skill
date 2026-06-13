@@ -17,7 +17,10 @@ const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
 const DEFAULT_IDLE_TIMEOUT = 8 * 60 * 60 * 1000;
 const IDLE_TIMEOUT = Number.parseInt(process.env.CDP_IDLE_TIMEOUT_MS || '', 10) || DEFAULT_IDLE_TIMEOUT;
-const DAEMON_CONNECT_RETRIES = 20;
+// First attach to a tab blocks on the user clicking Chrome's "Allow debugging"
+// modal. Give them real time instead of timing out at the generic 15s.
+const ALLOW_PROMPT_TIMEOUT = Number.parseInt(process.env.CDP_ALLOW_TIMEOUT_MS || '', 10) || 120000;
+const DAEMON_CONNECT_RETRIES = 30;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const IS_WINDOWS = process.platform === 'win32';
@@ -256,7 +259,7 @@ class CDP {
     });
   }
 
-  send(method, params = {}, sessionId) {
+  send(method, params = {}, sessionId, timeoutMs = TIMEOUT) {
     const id = ++this.#id;
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
@@ -268,7 +271,7 @@ class CDP {
           this.#pending.delete(id);
           reject(new Error(`Timeout: ${method}`));
         }
-      }, TIMEOUT);
+      }, timeoutMs);
     });
   }
 
@@ -600,57 +603,53 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
 async function runDaemon(targetId) {
   const sp = sockPath(targetId);
 
-  const cdp = new CDP();
+  // If a live daemon already owns this target's socket, defer to it instead of
+  // spawning a duplicate. A second attach would trigger a second Chrome "Allow
+  // debugging" prompt for the same tab, which is exactly the pile-up we avoid.
   try {
-    await cdp.connect(getWsUrl());
-  } catch (e) {
-    process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
-    process.exit(1);
-  }
+    const existing = await connectToSocket(sp);
+    existing.destroy();
+    process.exit(0);
+  } catch {}
+  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
 
+  const cdp = new CDP();
+
+  // Readiness gate: resolves once attached, rejects if connect/attach fails.
+  // The socket starts listening BEFORE we attach, so retry invocations connect
+  // and queue behind this promise rather than starting a rival daemon.
   let sessionId;
-  try {
-    const res = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-    sessionId = res.sessionId;
-  } catch (e) {
-    process.stderr.write(`Daemon: attach failed: ${e.message}\n`);
-    cdp.close();
-    process.exit(1);
-  }
+  let resolveReady, rejectReady;
+  const ready = new Promise((res, rej) => { resolveReady = res; rejectReady = rej; });
+  ready.catch(() => {}); // attach failure is surfaced per-command; don't crash the daemon
 
   // Shutdown helpers
+  let server;
   let alive = true;
-  function shutdown() {
+  function shutdown(code = 0) {
     if (!alive) return;
     alive = false;
-    server.close();
+    if (server) server.close();
     if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
-    cdp.close();
-    process.exit(0);
+    try { cdp.close(); } catch {}
+    process.exit(code);
   }
-
-  // Exit if target goes away or Chrome disconnects
-  cdp.onEvent('Target.targetDestroyed', (params) => {
-    if (params.targetId === targetId) shutdown();
-  });
-  cdp.onEvent('Target.detachedFromTarget', (params) => {
-    if (params.sessionId === sessionId) shutdown();
-  });
-  cdp.onClose(() => shutdown());
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', () => shutdown(0));
+  process.on('SIGINT', () => shutdown(0));
 
   // Idle timer
-  let idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
+  let idleTimer = setTimeout(() => shutdown(0), IDLE_TIMEOUT);
   function resetIdle() {
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
+    idleTimer = setTimeout(() => shutdown(0), IDLE_TIMEOUT);
   }
 
   // Handle a command
   async function handleCommand({ cmd, args }) {
+    if (cmd === 'stop') return { ok: true, result: '', stopAfter: true };
     resetIdle();
     try {
+      await ready; // block until the tab is attached (user clicked Allow)
       let result;
       switch (cmd) {
         case 'list': {
@@ -674,7 +673,6 @@ async function runDaemon(targetId) {
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
-        case 'stop': return { ok: true, result: '', stopAfter: true };
         default: return { ok: false, error: `Unknown command: ${cmd}` };
       }
       return { ok: true, result: result ?? '' };
@@ -688,7 +686,7 @@ async function runDaemon(targetId) {
   // Request:  { "id": <number>, "cmd": "<command>", "args": ["arg1", "arg2", ...] }
   // Response: { "id": <number>, "ok": <boolean>, "result": "<string>" }
   //           or { "id": <number>, "ok": false, "error": "<message>" }
-  const server = net.createServer((conn) => {
+  server = net.createServer((conn) => {
     let buf = '';
     conn.on('data', (chunk) => {
       buf += chunk.toString();
@@ -705,7 +703,7 @@ async function runDaemon(targetId) {
         }
         handleCommand(req).then((res) => {
           const payload = JSON.stringify({ ...res, id: req.id }) + '\n';
-          if (res.stopAfter) conn.end(payload, shutdown);
+          if (res.stopAfter) conn.end(payload, () => shutdown(0));
           else conn.write(payload);
         });
       }
@@ -713,12 +711,44 @@ async function runDaemon(targetId) {
   });
 
   server.on('error', (e) => {
+    // Lost a startup race to another daemon: defer without stealing its socket.
+    if (e.code === 'EADDRINUSE') process.exit(0);
     process.stderr.write(`Daemon server listen failed: ${e.message}\n`);
     process.exit(1);
   });
 
-  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
   server.listen(sp);
+
+  // Socket is live; now attach. This is what triggers Chrome's "Allow debugging"
+  // modal, and it can sit pending until the user clicks — give it real time.
+  try {
+    await cdp.connect(getWsUrl());
+  } catch (e) {
+    process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
+    rejectReady(new Error(`cannot connect to Chrome: ${e.message}`));
+    setTimeout(() => shutdown(1), 500);
+    return;
+  }
+  try {
+    const res = await cdp.send('Target.attachToTarget', { targetId, flatten: true }, undefined, ALLOW_PROMPT_TIMEOUT);
+    sessionId = res.sessionId;
+  } catch (e) {
+    process.stderr.write(`Daemon: attach failed: ${e.message}\n`);
+    rejectReady(new Error(`attach failed (did you click "Allow debugging"?): ${e.message}`));
+    setTimeout(() => shutdown(1), 500);
+    return;
+  }
+
+  // Exit if target goes away or Chrome disconnects
+  cdp.onEvent('Target.targetDestroyed', (params) => {
+    if (params.targetId === targetId) shutdown(0);
+  });
+  cdp.onEvent('Target.detachedFromTarget', (params) => {
+    if (params.sessionId === sessionId) shutdown(0);
+  });
+  cdp.onClose(() => shutdown(0));
+
+  resolveReady(sessionId);
 }
 
 // ---------------------------------------------------------------------------
