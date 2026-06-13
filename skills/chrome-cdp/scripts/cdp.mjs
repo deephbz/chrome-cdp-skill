@@ -174,7 +174,7 @@ async function doctorStr() {
     if (probe.state === 'http-no-json') {
       lines.push('');
       lines.push('Chrome remote debugging appears enabled through the Chrome 144+ auto-connect UI, but this raw CDP CLI cannot discover targets from that WebSocket-only mode without DevToolsActivePort.');
-      lines.push('Use Chrome DevTools MCP / agent-browser auto-connect for this browser session, or restart Chrome with legacy CDP flags and a non-default user-data-dir if raw CDP is required.');
+      lines.push('Use chrome-devtools-mcp --autoConnect for this browser session, then try agent-browser --auto-connect only if it can see the session. Restart Chrome with legacy CDP flags and a non-default user-data-dir if raw CDP is required.');
       return lines.join('\n');
     }
     lines.push('');
