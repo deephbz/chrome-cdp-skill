@@ -104,6 +104,8 @@ function remoteDebuggingHint(candidates = getPortFileCandidates()) {
 }
 
 function getWsUrl() {
+  if (process.env.CDP_WS_URL) return process.env.CDP_WS_URL;
+
   const candidates = getPortFileCandidates();
   const portFile = candidates.find(p => existsSync(p));
   if (!portFile) throw new Error(remoteDebuggingHint(candidates));
@@ -173,8 +175,12 @@ async function doctorStr() {
     lines.push(`Local debug port ${probe.host}:${probe.port}: ${probe.state}${probe.status ? ` (HTTP ${probe.status})` : ''}`);
     if (probe.state === 'http-no-json') {
       lines.push('');
-      lines.push('Chrome remote debugging appears enabled through the Chrome 144+ auto-connect UI, but this raw CDP CLI cannot discover targets from that WebSocket-only mode without DevToolsActivePort.');
-      lines.push('Use chrome-devtools-mcp --autoConnect for this browser session, then try agent-browser --auto-connect only if it can see the session. Restart Chrome with legacy CDP flags and a non-default user-data-dir if raw CDP is required.');
+      lines.push('Chrome remote debugging appears enabled through the Chrome 144+ auto-connect UI, but this is not a usable raw-CDP endpoint for cdp.mjs.');
+      lines.push('Evidence: 127.0.0.1:9222 is listening, but /json/version returns 404 and no DevToolsActivePort file exists.');
+      lines.push('For chrome-cdp-skill, do not run list/open/nav in this state. Raw CDP needs one of:');
+      lines.push('  - a DevToolsActivePort file containing the port and browser WebSocket path, or');
+      lines.push('  - CDP_WS_URL=ws://host:port/devtools/browser/<id> supplied explicitly.');
+      lines.push('The Chrome 144+ UI toggle alone is not enough for this raw CDP CLI on this machine.');
       return lines.join('\n');
     }
     lines.push('');

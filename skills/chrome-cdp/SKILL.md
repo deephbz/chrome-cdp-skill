@@ -12,6 +12,7 @@ Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no
 - Chrome (or Chromium, Brave, Edge, Vivaldi) with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch
 - Node.js 22+ (uses built-in WebSocket)
 - If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path
+- If you already know the browser-level WebSocket endpoint, set `CDP_WS_URL=ws://host:port/devtools/browser/<id>`
 
 ## Commands
 
@@ -25,7 +26,7 @@ scripts/cdp.mjs doctor
 
 Run this before browser work if the current Chrome CDP state is unknown. If it reports `No DevToolsActivePort found`, open `chrome://inspect/#remote-debugging` in the real Chrome app, enable remote debugging for that browser session, then rerun `doctor` and `list`.
 
-If `doctor` reports `Local debug port 127.0.0.1:9222: http-no-json (HTTP 404)`, Chrome is in the Chrome 144+ auto-connect mode. That is intended for `chrome-devtools-mcp --autoConnect` and does not expose the legacy `/json/*` discovery endpoints this raw CDP CLI needs. In that state, use `chrome-devtools-mcp --autoConnect` for the live profile, then try `agent-browser --auto-connect` only if it can see the session. Restart Chrome with legacy CDP flags and a non-default `--user-data-dir` when raw CDP is required.
+If `doctor` reports `Local debug port 127.0.0.1:9222: http-no-json (HTTP 404)`, Chrome is in the Chrome 144+ auto-connect UI mode, but this is **not** a usable raw-CDP endpoint for `cdp.mjs`: `/json/version` returns 404 and no `DevToolsActivePort` file exists. Do not run `list`, `open`, or page commands in that state. For this skill, raw CDP needs either a `DevToolsActivePort` file or an explicit `CDP_WS_URL=ws://host:port/devtools/browser/<id>`.
 
 ### List open pages
 
