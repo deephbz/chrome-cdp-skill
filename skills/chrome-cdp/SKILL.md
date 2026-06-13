@@ -74,4 +74,5 @@ CSS px = screenshot image px / DPR
 
 - Prefer `snap --compact` over `html` for page structure.
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
-- Chrome shows an "Allow debugging" modal once per tab on first access. A background daemon keeps the session alive so subsequent commands need no further approval. Daemons auto-exit after 20 minutes of inactivity.
+- Chrome shows an "Allow debugging" modal once per tab on first access. A background daemon keeps the session alive so subsequent commands need no further approval. Daemons auto-exit after 8 hours of inactivity by default; override with `CDP_IDLE_TIMEOUT_MS`.
+- To minimize prompts, reuse existing targets, avoid `scripts/cdp.mjs open` unless a new tab is necessary, and do not run `scripts/cdp.mjs stop` until the browser work is done.

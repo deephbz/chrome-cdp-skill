@@ -5,7 +5,7 @@
 //
 // Per-tab persistent daemon: page commands go through a daemon that holds
 // the CDP session open. Chrome's "Allow debugging" modal fires once per
-// daemon (= once per tab). Daemons auto-exit after 20min idle.
+// daemon (= once per tab). Daemons auto-exit after the configured idle timeout.
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
@@ -15,7 +15,8 @@ import net from 'net';
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
-const IDLE_TIMEOUT = 20 * 60 * 1000;
+const DEFAULT_IDLE_TIMEOUT = 8 * 60 * 60 * 1000;
+const IDLE_TIMEOUT = Number.parseInt(process.env.CDP_IDLE_TIMEOUT_MS || '', 10) || DEFAULT_IDLE_TIMEOUT;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
@@ -771,7 +772,8 @@ DAEMON IPC (for advanced use / scripting)
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
   type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
-  The socket disappears after 20 min of inactivity or when the tab closes.
+  The socket disappears after the idle timeout or when the tab closes.
+  Default idle timeout is 8 hours. Override with CDP_IDLE_TIMEOUT_MS.
 `;
 
 const NEEDS_TARGET = new Set([
